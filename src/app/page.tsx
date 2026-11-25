@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { ShieldCheck, Zap, Share2 } from "lucide-react";
 import { BrandMark } from "@/components/BrandMark";
 import { CreateRoomForm } from "@/components/CreateRoomForm";
@@ -62,6 +63,19 @@ export default function HomePage() {
         <main>
           <CreateRoomForm />
         </main>
+
+        {/* Footer con enlace obligatorio a Política de Privacidad para Google Play */}
+        <footer className="mt-2 border-t border-[var(--border-subtle)] pt-5 text-center space-y-1.5">
+          <Link
+            href="/privacidad"
+            className="inline-flex items-center gap-1.5 text-xs font-semibold text-[var(--ink-secondary)] underline underline-offset-4 decoration-[var(--border-strong)] hover:text-[var(--accent-primary)] hover:decoration-[var(--accent-primary)] transition-colors"
+          >
+            Política de Privacidad
+          </Link>
+          <p className="text-[11px] text-[var(--ink-muted)]">
+            La Vaca · Cuentas claras en Colombia
+          </p>
+        </footer>
       </div>
     </div>
   );

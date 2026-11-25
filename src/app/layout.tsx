@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Plus_Jakarta_Sans, JetBrains_Mono } from "next/font/google";
+import { ServiceWorkerRegistrar } from "@/components/ServiceWorkerRegistrar";
 import "./globals.css";
 
 const plusJakarta = Plus_Jakarta_Sans({
@@ -28,8 +29,14 @@ export const metadata: Metadata = {
     "Escanea la factura con IA o arma una vaca en segundos. Cada quien elige lo suyo y paga fácil por Nequi, Daviplata o llave Bre-B sin registrarse.",
   manifest: "/manifest.json",
   icons: {
-    icon: "/icon.svg",
-    apple: "/icon.svg",
+    icon: [
+      { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon-512.png", sizes: "512x512", type: "image/png" },
+      { url: "/icon.svg", type: "image/svg+xml" },
+    ],
+    apple: [
+      { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+    ],
   },
   appleWebApp: {
     capable: true,
@@ -76,6 +83,7 @@ export default function RootLayout({
     >
       <body className="antialiased selection:bg-[#10B981]/25 selection:text-[var(--ink-primary)]">
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+        <ServiceWorkerRegistrar />
         {children}
       </body>
     </html>
