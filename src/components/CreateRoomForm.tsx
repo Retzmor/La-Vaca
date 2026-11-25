@@ -96,12 +96,18 @@ export function CreateRoomForm() {
 
     if (mode === "receipt") {
       validItems = items
-        .map((item) => ({
-          ...item,
-          name: item.name.trim(),
-          price: Math.max(0, Math.round(item.price)),
-          quantity: Math.max(1, Math.round(item.quantity)),
-        }))
+        .map((item) => {
+          const parsedQty = Number.parseInt(String(item.quantity), 10);
+          return {
+            ...item,
+            name: item.name.trim(),
+            price: Math.max(0, Math.round(item.price)),
+            quantity:
+              Number.isFinite(parsedQty) && parsedQty >= 1
+                ? Math.min(99, parsedQty)
+                : 1,
+          };
+        })
         .filter((item) => item.name.length > 0 && item.price > 0);
 
       if (validItems.length === 0) {
@@ -170,7 +176,7 @@ export function CreateRoomForm() {
             room_id: createdRoom.id,
             name: item.name,
             price: item.price,
-            quantity: item.quantity,
+            quantity: Math.max(1, Number(item.quantity) || 1),
             sort_order: idx,
           }))
         );

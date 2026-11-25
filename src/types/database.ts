@@ -99,7 +99,7 @@ export type DraftReceiptItem = {
   id: string;
   name: string;
   price: number;
-  quantity: number;
+  quantity: number | "";
 };
 
 /** Respuesta estructurada del endpoint /api/scan-receipt */

@@ -7,8 +7,8 @@ export interface CompressedImageResult {
   approximateBytes: number;
 }
 
-const DEFAULT_MAX_DIMENSION = 1600;
-const DEFAULT_QUALITY = 0.82;
+const DEFAULT_MAX_DIMENSION = 1280;
+const DEFAULT_QUALITY = 0.75;
 
 function loadImageFromFile(file: File): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -39,7 +39,7 @@ export async function compressReceiptImage(
   maxDimension = DEFAULT_MAX_DIMENSION,
   quality = DEFAULT_QUALITY
 ): Promise<CompressedImageResult> {
-  if (!file.type.startsWith("image/")) {
+  if (file.type && !file.type.startsWith("image/")) {
     throw new Error("El archivo seleccionado no es una imagen válida.");
   }
 
@@ -56,8 +56,8 @@ export async function compressReceiptImage(
 
   if (originalWidth > maxDimension || originalHeight > maxDimension) {
     const scale = maxDimension / Math.max(originalWidth, originalHeight);
-    targetWidth = Math.round(originalWidth * scale);
-    targetHeight = Math.round(originalHeight * scale);
+    targetWidth = Math.max(1, Math.round(originalWidth * scale));
+    targetHeight = Math.max(1, Math.round(originalHeight * scale));
   }
 
   const canvas = document.createElement("canvas");

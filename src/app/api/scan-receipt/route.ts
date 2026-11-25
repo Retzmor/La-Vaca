@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
-import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { parseCOPInput } from "@/lib/formatters";
 import type { ScannedReceiptResult } from "@/types/database";
 
 export const runtime = "nodejs";
-export const maxDuration = 45;
+export const maxDuration = 30;
 
 const PRIMARY_MODEL = "gemini-3.8-flash";
 const STATIC_FALLBACK_MODELS = ["gemini-3.8-flash-lite", "gemini-3.5-flash"] as const;
@@ -12,6 +12,7 @@ const ATTEMPT_TIMEOUT_MS = 12_000;
 const OVERALL_DEADLINE_MS = 20_000;
 const LIST_MODELS_TIMEOUT_MS = 3_500;
 const MAX_MODEL_ATTEMPTS = 4;
+const MAX_IMAGE_BYTES = Math.round(3.5 * 1024 * 1024);
 
 const CONGESTED_ERROR_MESSAGE =
   "Los servidores de IA están congestionados en este momento, intenta de nuevo en unos segundos o ingresa los ítems abajo";
@@ -147,8 +148,17 @@ function sanitizeScannedResult(raw: unknown): ScannedReceiptResult {
 interface ErrorClassification {
   retryable: boolean;
   congested: boolean;
-  thinkingUnsupported: boolean;
+  isAuthError: boolean;
   statusCode: number | null;
+  rawMessage: string;
+}
+
+function sanitizeDetailText(text: string): string {
+  return text
+    .replace(/AIza[0-9A-Za-z_-]+/g, "[KEY]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 220);
 }
 
 function classifyGeminiError(error: unknown): ErrorClassification {
@@ -208,25 +218,24 @@ function classifyGeminiError(error: unknown): ErrorClassification {
     combined.includes("not found") ||
     combined.includes("not supported for generatecontent");
 
-  const thinkingUnsupported =
-    (statusCode === 400 || combined.includes("400") || combined.includes("invalid_argument")) &&
-    (combined.includes("thinking") ||
-      combined.includes("thinkingbudget") ||
-      combined.includes("thinkinglevel"));
+  const isAuthError =
+    statusCode === 401 ||
+    statusCode === 403 ||
+    combined.includes("api_key_invalid") ||
+    combined.includes("api key not valid") ||
+    combined.includes("permission_denied");
 
   return {
     retryable: isTimeout || isOverloaded || isNotFound,
     congested: isTimeout || isOverloaded,
-    thinkingUnsupported,
+    isAuthError,
     statusCode,
+    rawMessage: sanitizeDetailText(
+      causeCode && !message.includes(causeCode)
+        ? `${causeCode}: ${message}`
+        : message || name || "Error desconocido"
+    ),
   };
-}
-
-function getThinkingConfigForModel(model: string) {
-  if (model.includes("gemini-3")) {
-    return { thinkingLevel: ThinkingLevel.MINIMAL };
-  }
-  return { thinkingBudget: 0 };
 }
 
 async function generateWithTimeout(
@@ -234,8 +243,7 @@ async function generateWithTimeout(
   model: string,
   imageBase64: string,
   mimeType: string,
-  timeoutMs: number,
-  useThinkingConfig = true
+  timeoutMs: number
 ) {
   const effectiveTimeout = Math.max(1_000, Math.min(ATTEMPT_TIMEOUT_MS, timeoutMs));
   const abortSignal = AbortSignal.timeout(effectiveTimeout);
@@ -243,7 +251,12 @@ async function generateWithTimeout(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reject(new DOMException("La solicitud a Gemini superó el tiempo límite", "TimeoutError"));
+      reject(
+        new DOMException(
+          `Timeout tras ${Math.round(effectiveTimeout / 1000)}s`,
+          "TimeoutError"
+        )
+      );
     }, effectiveTimeout + 100);
   });
 
@@ -267,9 +280,6 @@ async function generateWithTimeout(
         temperature: 0.1,
         responseMimeType: "application/json",
         responseSchema: receiptResponseSchema,
-        ...(useThinkingConfig
-          ? { thinkingConfig: getThinkingConfigForModel(model) }
-          : {}),
       },
     });
 
@@ -324,7 +334,6 @@ async function discoverAvailableFlashModels(
         candidates.push(normalized);
       }
 
-      // Priorizar modelos más recientes o estables
       candidates.sort((a, b) => b.localeCompare(a));
       return candidates;
     } catch {
@@ -340,13 +349,17 @@ async function discoverAvailableFlashModels(
 }
 
 export async function POST(request: Request) {
+  let lastModelTried = PRIMARY_MODEL;
+
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY?.trim();
     if (!apiKey) {
       return NextResponse.json(
         {
           error:
             "Falta configurar GEMINI_API_KEY en las variables de entorno del servidor. Mientras tanto, puedes ingresar los ítems manualmente.",
+          statusCode: 500,
+          detail: "HTTP 500 · GEMINI_API_KEY ausente o vacía",
         },
         { status: 500 }
       );
@@ -355,7 +368,11 @@ export async function POST(request: Request) {
     const body = (await request.json()) as ScanReceiptRequestBody;
     if (!body?.imageBase64 || typeof body.imageBase64 !== "string") {
       return NextResponse.json(
-        { error: "No recibimos ninguna imagen de la factura." },
+        {
+          error: "No recibimos ninguna imagen de la factura.",
+          statusCode: 400,
+          detail: "HTTP 400 · imageBase64 faltante",
+        },
         { status: 400 }
       );
     }
@@ -367,17 +384,24 @@ export async function POST(request: Request) {
 
     if (!data || data.length < 100) {
       return NextResponse.json(
-        { error: "La imagen enviada parece estar vacía o dañada." },
+        {
+          error: "La imagen enviada parece estar vacía o dañada.",
+          statusCode: 400,
+          detail: "HTTP 400 · Payload de imagen vacío",
+        },
         { status: 400 }
       );
     }
 
-    // Límite razonable ~8MB en base64 (~6MB imagen)
-    if (data.length > 8 * 1024 * 1024) {
+    const approximateBytes = Math.round((data.length * 3) / 4);
+    if (approximateBytes > MAX_IMAGE_BYTES) {
+      const sizeMb = (approximateBytes / (1024 * 1024)).toFixed(2);
       return NextResponse.json(
         {
           error:
-            "La foto es demasiado pesada. Intenta tomarla de nuevo o agregar los ítems manualmente.",
+            "La foto pesa más de 3.5 MB. Toma una foto más ligera o desde un poco más lejos para continuar.",
+          statusCode: 413,
+          detail: `HTTP 413 · Imagen de ${sizeMb} MB supera el límite de 3.5 MB`,
         },
         { status: 413 }
       );
@@ -397,12 +421,15 @@ export async function POST(request: Request) {
     let discoveredModelsLoaded = false;
     let sawCongestion = false;
     let lastError: unknown = null;
+    let lastDetail = "";
     let responseText: string | undefined;
 
     while (triedModels.size < MAX_MODEL_ATTEMPTS) {
       const remainingMs = deadlineAt - Date.now();
       if (remainingMs < 2_500) {
         sawCongestion = true;
+        lastDetail =
+          lastDetail || `Timeout global de ${Math.round(OVERALL_DEADLINE_MS / 1000)}s`;
         break;
       }
 
@@ -417,6 +444,7 @@ export async function POST(request: Request) {
       const model = queue.shift();
       if (!model || triedModels.has(model)) continue;
       triedModels.add(model);
+      lastModelTried = model;
 
       try {
         const res = await generateWithTimeout(
@@ -424,45 +452,20 @@ export async function POST(request: Request) {
           model,
           data,
           safeMimeType,
-          deadlineAt - Date.now(),
-          true
+          deadlineAt - Date.now()
         );
         responseText = res.text?.trim();
         break;
       } catch (err) {
         lastError = err;
         const info = classifyGeminiError(err);
-
-        // Si el modelo concreto no acepta thinkingBudget/thinkingLevel, reintenta ese mismo sin thinkingConfig
-        if (info.thinkingUnsupported && deadlineAt - Date.now() >= 2_500) {
-          try {
-            const res = await generateWithTimeout(
-              ai,
-              model,
-              data,
-              safeMimeType,
-              deadlineAt - Date.now(),
-              false
-            );
-            responseText = res.text?.trim();
-            break;
-          } catch (retryErr) {
-            lastError = retryErr;
-            const retryInfo = classifyGeminiError(retryErr);
-            if (retryInfo.congested) sawCongestion = true;
-            if (!retryInfo.retryable) throw retryErr;
-            continue;
-          }
-        }
+        lastDetail = `${model} (${info.statusCode ?? "timeout"}): ${info.rawMessage}`;
 
         if (info.congested) {
           sawCongestion = true;
         }
 
-        console.warn(
-          `[scan-receipt] Falló modelo "${model}" (status=${info.statusCode ?? "timeout"}):`,
-          err instanceof Error ? err.message : err
-        );
+        console.warn(`[scan-receipt] Falló ${lastDetail}`);
 
         if (!info.retryable) {
           throw err;
@@ -473,7 +476,11 @@ export async function POST(request: Request) {
     if (responseText === undefined) {
       if (sawCongestion) {
         return NextResponse.json(
-          { error: CONGESTED_ERROR_MESSAGE },
+          {
+            error: CONGESTED_ERROR_MESSAGE,
+            statusCode: 503,
+            detail: `HTTP 503 · ${lastDetail || "Modelos Flash sobrecargados o timeout"}`,
+          },
           { status: 503 }
         );
       }
@@ -486,6 +493,8 @@ export async function POST(request: Request) {
         {
           error:
             "No pudimos leer los datos de la factura. Revisa que la foto esté enfocada o agrega los ítems manualmente.",
+          statusCode: 422,
+          detail: `HTTP 422 · ${lastModelTried} devolvió respuesta vacía`,
         },
         { status: 422 }
       );
@@ -499,6 +508,8 @@ export async function POST(request: Request) {
         {
           error:
             "La IA devolvió una respuesta inesperada al leer la foto. Puedes reintentar o agregar los ítems a mano.",
+          statusCode: 422,
+          detail: `HTTP 422 · ${lastModelTried} devolvió JSON inválido`,
         },
         { status: 422 }
       );
@@ -511,6 +522,8 @@ export async function POST(request: Request) {
         {
           error:
             "No encontramos ítems legibles en esta foto. Puede estar borrosa o con poca luz; intenta tomarla de nuevo o agrégalos manualmente.",
+          statusCode: 422,
+          detail: `HTTP 422 · ${lastModelTried} no detectó ítems con precio`,
           result,
         },
         { status: 422 }
@@ -524,17 +537,41 @@ export async function POST(request: Request) {
 
     if (info.congested) {
       return NextResponse.json(
-        { error: CONGESTED_ERROR_MESSAGE },
+        {
+          error: CONGESTED_ERROR_MESSAGE,
+          statusCode: 503,
+          detail: `HTTP ${info.statusCode ?? 503} · ${lastModelTried}: ${info.rawMessage}`,
+        },
         { status: 503 }
       );
     }
+
+    if (info.isAuthError) {
+      const code = info.statusCode ?? 403;
+      return NextResponse.json(
+        {
+          error:
+            "La clave de Gemini API fue rechazada o no tiene permisos activos. Revisa GEMINI_API_KEY en Vercel.",
+          statusCode: code,
+          detail: `HTTP ${code} · ${lastModelTried}: ${info.rawMessage}`,
+        },
+        { status: code }
+      );
+    }
+
+    const httpStatus =
+      info.statusCode && info.statusCode >= 400 && info.statusCode < 600
+        ? info.statusCode
+        : 500;
 
     return NextResponse.json(
       {
         error:
           "Hubo un problema conectando con la IA para leer la factura. Intenta de nuevo o ingresa los ítems manualmente.",
+        statusCode: httpStatus,
+        detail: `HTTP ${httpStatus} · ${lastModelTried}: ${info.rawMessage}`,
       },
-      { status: 500 }
+      { status: httpStatus }
     );
   }
 }

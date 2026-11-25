@@ -6,6 +6,7 @@ import {
   ImagePlus,
   Sparkles,
   Plus,
+  Minus,
   Trash2,
   AlertCircle,
   RefreshCw,
@@ -30,6 +31,8 @@ interface ReceiptUploaderProps {
   onTipChange: (tip: number) => void;
 }
 
+const MAX_UPLOAD_BYTES = Math.round(3.5 * 1024 * 1024);
+
 const TIP_PRESETS = [
   { label: "Sin propina", percent: 0 },
   { label: "5%", percent: 5 },
@@ -42,6 +45,13 @@ function createDraftId(): string {
     return crypto.randomUUID();
   }
   return `item-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeQuantity(value: number | ""): number {
+  if (value === "") return 1;
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return 1;
+  return Math.min(99, parsed);
 }
 
 export function ReceiptUploader({
@@ -58,16 +68,27 @@ export function ReceiptUploader({
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [scanDetail, setScanDetail] = useState<string | null>(null);
   const [scanSucceeded, setScanSucceeded] = useState(false);
   const [manualModeOpened, setManualModeOpened] = useState(false);
 
   const subtotal = items.reduce((sum, item) => sum + Math.max(0, item.price), 0);
   const grandTotal = subtotal + Math.max(0, taxAmount) + Math.max(0, tipAmount);
 
+  function ensureManualFallbackRow() {
+    setManualModeOpened(true);
+    if (items.length === 0) {
+      onItemsChange([
+        { id: createDraftId(), name: "", price: 0, quantity: 1 },
+      ]);
+    }
+  }
+
   async function handleFileSelected(file: File | null | undefined) {
     if (!file) return;
 
     setScanError(null);
+    setScanDetail(null);
     setScanSucceeded(false);
     setIsScanning(true);
 
@@ -75,8 +96,18 @@ export function ReceiptUploader({
     const timeoutId = window.setTimeout(() => controller.abort(), 22_000);
 
     try {
-      const compressed = await compressReceiptImage(file);
+      const compressed = await compressReceiptImage(file, 1280, 0.75);
       setPreviewUrl(compressed.dataUrl);
+
+      if (compressed.approximateBytes > MAX_UPLOAD_BYTES) {
+        const mb = (compressed.approximateBytes / (1024 * 1024)).toFixed(2);
+        setScanError(
+          "Esta foto es muy pesada incluso después de comprimirla (supera 3.5 MB). Toma una foto más ligera o desde un poco más lejos."
+        );
+        setScanDetail(`HTTP 413 (cliente) · Tamaño comprimido: ${mb} MB`);
+        ensureManualFallbackRow();
+        return;
+      }
 
       const response = await fetch("/api/scan-receipt", {
         method: "POST",
@@ -88,22 +119,41 @@ export function ReceiptUploader({
         }),
       });
 
-      const payload = (await response.json()) as
+      const rawResponseText = await response.text();
+      let payload:
         | ScannedReceiptResult
-        | { error?: string; result?: ScannedReceiptResult };
+        | {
+            error?: string;
+            detail?: string;
+            statusCode?: number;
+            result?: ScannedReceiptResult;
+          }
+        | null = null;
+
+      try {
+        payload = rawResponseText ? JSON.parse(rawResponseText) : null;
+      } catch {
+        payload = null;
+      }
 
       if (!response.ok) {
         const errorMessage =
-          "error" in payload && payload.error
+          payload && "error" in payload && payload.error
             ? payload.error
+            : response.status === 413
+            ? "La foto superó el límite de tamaño del servidor (413). Toma una foto más ligera."
             : "No pudimos leer la factura. Revisa la foto o ingresa los ítems a mano.";
+
+        const detailText =
+          payload && "detail" in payload && payload.detail
+            ? payload.detail
+            : `HTTP ${response.status}${
+                rawResponseText ? ` · ${rawResponseText.slice(0, 140)}` : ""
+              }`;
+
         setScanError(errorMessage);
-        setManualModeOpened(true);
-        if (items.length === 0) {
-          onItemsChange([
-            { id: createDraftId(), name: "", price: 0, quantity: 1 },
-          ]);
-        }
+        setScanDetail(detailText);
+        ensureManualFallbackRow();
         return;
       }
 
@@ -112,7 +162,7 @@ export function ReceiptUploader({
         id: createDraftId(),
         name: item.name,
         price: item.price,
-        quantity: item.quantity,
+        quantity: normalizeQuantity(item.quantity),
       }));
 
       onItemsChange(mappedItems);
@@ -128,13 +178,16 @@ export function ReceiptUploader({
         : error instanceof Error
         ? error.message
         : "Ocurrió un error procesando la imagen. Puedes agregar los ítems manualmente.";
+
       setScanError(message);
-      setManualModeOpened(true);
-      if (items.length === 0) {
-        onItemsChange([
-          { id: createDraftId(), name: "", price: 0, quantity: 1 },
-        ]);
-      }
+      setScanDetail(
+        isAbort
+          ? "Timeout en cliente (22s)"
+          : error instanceof Error
+          ? error.message.slice(0, 140)
+          : "Error de red inesperado"
+      );
+      ensureManualFallbackRow();
     } finally {
       window.clearTimeout(timeoutId);
       setIsScanning(false);
@@ -146,6 +199,7 @@ export function ReceiptUploader({
   function handleOpenManual() {
     setManualModeOpened(true);
     setScanError(null);
+    setScanDetail(null);
     if (items.length === 0) {
       onItemsChange([
         { id: createDraftId(), name: "", price: 0, quantity: 1 },
@@ -179,12 +233,13 @@ export function ReceiptUploader({
    * en unidades individuales ("Cerveza $ 12.000") con 1 toque.
    */
   function handleSplitQuantity(target: DraftReceiptItem) {
-    if (target.quantity <= 1) return;
-    const unitBase = Math.floor(target.price / target.quantity);
-    const remainder = target.price - unitBase * target.quantity;
+    const qty = normalizeQuantity(target.quantity);
+    if (qty <= 1) return;
+    const unitBase = Math.floor(target.price / qty);
+    const remainder = target.price - unitBase * qty;
 
     const expanded: DraftReceiptItem[] = Array.from(
-      { length: target.quantity },
+      { length: qty },
       (_, idx) => ({
         id: createDraftId(),
         name: target.name,
@@ -350,7 +405,7 @@ export function ReceiptUploader({
           </div>
         )}
 
-        {/* Banner de error amigable */}
+        {/* Banner de error amigable + detalle técnico discreto */}
         {scanError && (
           <div
             role="alert"
@@ -358,13 +413,18 @@ export function ReceiptUploader({
           >
             <div className="flex items-start gap-2">
               <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
-              <div className="space-y-1">
+              <div className="space-y-1 min-w-0">
                 <p className="font-bold">No pudimos leer bien la factura</p>
                 <p className="opacity-90 leading-relaxed">{scanError}</p>
                 <p className="font-semibold pt-0.5">
                   Puedes volver a intentar con mejor luz o llenar los ítems aquí
                   abajo.
                 </p>
+                {scanDetail && (
+                  <p className="pt-1 font-mono text-[10px] opacity-70 break-words">
+                    Detalle: {scanDetail}
+                  </p>
+                )}
               </div>
             </div>
           </div>
@@ -395,91 +455,131 @@ export function ReceiptUploader({
                 Aún no hay ítems. Toca &ldquo;Agregar ítem&rdquo; para comenzar.
               </div>
             ) : (
-              items.map((item, idx) => (
-                <div
-                  key={item.id}
-                  className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3 space-y-2"
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-[var(--bg-subtle)] text-[11px] font-bold text-[var(--ink-secondary)]">
-                      {idx + 1}
-                    </span>
-                    <input
-                      type="text"
-                      value={item.name}
-                      onChange={(e) =>
-                        handleUpdateItem(item.id, { name: e.target.value })
-                      }
-                      placeholder="Ej: Bandeja paisa, Club Colombia..."
-                      aria-label={`Nombre del ítem ${idx + 1}`}
-                      className="min-w-0 flex-1 rounded-lg border border-transparent bg-[var(--bg-surface)] px-2.5 py-2 text-sm font-medium text-[var(--ink-primary)] placeholder:text-[var(--ink-muted)] focus:border-[var(--accent-primary)] focus:outline-none"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteItem(item.id)}
-                      aria-label={`Eliminar ítem ${item.name || idx + 1}`}
-                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-[var(--ink-muted)] hover:bg-[var(--badge-danger-bg)] hover:text-[var(--badge-danger-ink)] transition-colors"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
-                  </div>
+              items.map((item, idx) => {
+                const qtyNumber = normalizeQuantity(item.quantity);
 
-                  <div className="flex flex-wrap items-center gap-2 pl-8">
-                    {/* Cantidad */}
-                    <label className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-2 py-1.5 text-xs text-[var(--ink-secondary)]">
-                      <span className="font-medium">Cant.</span>
-                      <input
-                        type="number"
-                        min={1}
-                        max={99}
-                        value={item.quantity}
-                        onChange={(e) => {
-                          const qty = Math.max(
-                            1,
-                            Number.parseInt(e.target.value || "1", 10) || 1
-                          );
-                          handleUpdateItem(item.id, { quantity: qty });
-                        }}
-                        aria-label={`Cantidad del ítem ${idx + 1}`}
-                        className="w-10 bg-transparent text-center font-money text-sm font-semibold text-[var(--ink-primary)] focus:outline-none"
-                      />
-                    </label>
-
-                    {/* Precio total de la línea en COP */}
-                    <label className="relative flex-1 min-w-[130px] flex items-center rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-2.5 py-1.5 focus-within:border-[var(--accent-primary)]">
-                      <span className="font-money text-xs font-semibold text-[var(--ink-muted)] mr-1.5">
-                        $
+                return (
+                  <div
+                    key={item.id}
+                    className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3 space-y-2"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-[var(--bg-subtle)] text-[11px] font-bold text-[var(--ink-secondary)]">
+                        {idx + 1}
                       </span>
                       <input
                         type="text"
-                        inputMode="numeric"
-                        value={formatCOPNumber(item.price)}
+                        value={item.name}
                         onChange={(e) =>
-                          handleUpdateItem(item.id, {
-                            price: parseCOPInput(e.target.value),
-                          })
+                          handleUpdateItem(item.id, { name: e.target.value })
                         }
-                        placeholder="0"
-                        aria-label={`Precio total del ítem ${idx + 1} en pesos`}
-                        className="w-full bg-transparent font-money text-sm font-bold text-[var(--ink-primary)] placeholder:text-[var(--ink-muted)] focus:outline-none text-right"
+                        placeholder="Ej: Bandeja paisa, Club Colombia..."
+                        aria-label={`Nombre del ítem ${idx + 1}`}
+                        className="min-w-0 flex-1 rounded-lg border border-transparent bg-[var(--bg-surface)] px-2.5 py-2 text-sm font-medium text-[var(--ink-primary)] placeholder:text-[var(--ink-muted)] focus:border-[var(--accent-primary)] focus:outline-none"
                       />
-                    </label>
-
-                    {/* Botón inteligente para separar líneas con cantidad > 1 */}
-                    {item.quantity > 1 && item.price > 0 && (
                       <button
                         type="button"
-                        onClick={() => handleSplitQuantity(item)}
-                        className="inline-flex items-center gap-1 rounded-lg border border-[var(--accent-border)] bg-[var(--accent-soft)] px-2.5 py-1.5 text-[11px] font-bold text-[var(--accent-ink)] hover:bg-[var(--accent-soft-hover)] transition-colors"
-                        title="Desglosa esta línea en ítems individuales por unidad"
+                        onClick={() => handleDeleteItem(item.id)}
+                        aria-label={`Eliminar ítem ${item.name || idx + 1}`}
+                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-[var(--ink-muted)] hover:bg-[var(--badge-danger-bg)] hover:text-[var(--badge-danger-ink)] transition-colors"
                       >
-                        <Split className="h-3.5 w-3.5" />
-                        Separar en {item.quantity}
+                        <Trash2 className="h-4 w-4" />
                       </button>
-                    )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 pl-8">
+                      {/* Cantidad con - / + táctil y borrado libre en móvil */}
+                      <div className="inline-flex items-center rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] p-0.5 text-xs text-[var(--ink-secondary)]">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleUpdateItem(item.id, {
+                              quantity: Math.max(1, qtyNumber - 1),
+                            })
+                          }
+                          disabled={item.quantity !== "" && qtyNumber <= 1}
+                          aria-label={`Disminuir cantidad del ítem ${idx + 1}`}
+                          className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--ink-primary)] hover:bg-[var(--bg-elevated)] active:scale-95 disabled:opacity-35 disabled:cursor-not-allowed transition-colors"
+                        >
+                          <Minus className="h-3.5 w-3.5" />
+                        </button>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          value={item.quantity}
+                          onChange={(e) => {
+                            const digits = e.target.value
+                              .replace(/\D/g, "")
+                              .slice(0, 2);
+                            if (digits === "") {
+                              handleUpdateItem(item.id, { quantity: "" });
+                              return;
+                            }
+                            const parsed = Number.parseInt(digits, 10);
+                            handleUpdateItem(item.id, {
+                              quantity: Math.min(99, parsed),
+                            });
+                          }}
+                          onBlur={() =>
+                            handleUpdateItem(item.id, {
+                              quantity: normalizeQuantity(item.quantity),
+                            })
+                          }
+                          aria-label={`Cantidad del ítem ${idx + 1}`}
+                          className="w-8 bg-transparent text-center font-money text-sm font-bold text-[var(--ink-primary)] focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const base = item.quantity === "" ? 0 : qtyNumber;
+                            handleUpdateItem(item.id, {
+                              quantity: Math.min(99, base + 1),
+                            });
+                          }}
+                          aria-label={`Aumentar cantidad del ítem ${idx + 1}`}
+                          className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--ink-primary)] hover:bg-[var(--bg-elevated)] active:scale-95 transition-colors"
+                        >
+                          <Plus className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+
+                      {/* Precio total de la línea en COP */}
+                      <label className="relative flex-1 min-w-[130px] flex items-center rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-2.5 py-2 focus-within:border-[var(--accent-primary)]">
+                        <span className="font-money text-xs font-semibold text-[var(--ink-muted)] mr-1.5">
+                          $
+                        </span>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          value={formatCOPNumber(item.price)}
+                          onChange={(e) =>
+                            handleUpdateItem(item.id, {
+                              price: parseCOPInput(e.target.value),
+                            })
+                          }
+                          placeholder="0"
+                          aria-label={`Precio total del ítem ${idx + 1} en pesos`}
+                          className="w-full bg-transparent font-money text-sm font-bold text-[var(--ink-primary)] placeholder:text-[var(--ink-muted)] focus:outline-none text-right"
+                        />
+                      </label>
+
+                      {/* Botón inteligente para separar líneas con cantidad > 1 */}
+                      {qtyNumber > 1 && item.price > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => handleSplitQuantity(item)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-[var(--accent-border)] bg-[var(--accent-soft)] px-2.5 py-2 text-[11px] font-bold text-[var(--accent-ink)] hover:bg-[var(--accent-soft-hover)] transition-colors"
+                          title="Desglosa esta línea en ítems individuales por unidad"
+                        >
+                          <Split className="h-3.5 w-3.5" />
+                          Separar en {qtyNumber}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
 
