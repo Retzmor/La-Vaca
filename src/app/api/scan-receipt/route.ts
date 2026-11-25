@@ -1,21 +1,27 @@
 import { NextResponse } from "next/server";
-import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import { parseCOPInput } from "@/lib/formatters";
 import type { ScannedReceiptResult } from "@/types/database";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
-const PRIMARY_MODEL = "gemini-3.8-flash";
-const FALLBACK_MODEL = "gemini-3.8-flash-lite";
-const ATTEMPT_TIMEOUT_MS = 25_000;
+const ATTEMPT_TIMEOUT_MS = 9_000;
+const OVERALL_DEADLINE_MS = 27_500;
 const MAX_IMAGE_BYTES = Math.round(3.5 * 1024 * 1024);
 
-const CONGESTED_ERROR_MESSAGE =
-  "Los servidores de IA están congestionados en este momento, intenta de nuevo en unos segundos o ingresa los ítems abajo";
+interface ModelCandidate {
+  id: string;
+  useThinkingBudgetZero: boolean;
+}
 
-const TIMEOUT_ERROR_MESSAGE =
-  "La lectura de la factura tardó más de 25 segundos. Intenta con una foto más nítida o ingresa los ítems abajo.";
+const MODEL_CHAIN: readonly ModelCandidate[] = [
+  { id: "gemini-2.5-flash", useThinkingBudgetZero: true },
+  { id: "gemini-2.5-flash-lite", useThinkingBudgetZero: true },
+  { id: "gemini-2.0-flash", useThinkingBudgetZero: false },
+];
+
+const CONGESTED_ERROR_MESSAGE =
+  "Los servidores de IA están congestionados o tardaron demasiado. Intenta de nuevo en unos segundos o ingresa los ítems abajo.";
 
 const ALLOWED_MIME_TYPES = new Set([
   "image/jpeg",
@@ -31,56 +37,56 @@ interface ScanReceiptRequestBody {
   mimeType?: string;
 }
 
-const receiptResponseSchema = {
-  type: Type.OBJECT,
-  properties: {
-    items: {
-      type: Type.ARRAY,
-      description:
-        "Productos consumidos. Excluye subtotales, totales, impuestos y propina.",
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          name: { type: Type.STRING },
-          price: {
-            type: Type.INTEGER,
-            description: "Valor TOTAL de la línea en pesos COP enteros.",
-          },
-          quantity: { type: Type.INTEGER },
-        },
-        required: ["name", "price", "quantity"],
-      },
-    },
-    tax_amount: {
-      type: Type.INTEGER,
-      description: "Impoconsumo o IVA si se suma aparte, si no 0.",
-    },
-    tip_amount: {
-      type: Type.INTEGER,
-      description: "Propina voluntaria si aparece, si no 0.",
-    },
-  },
-  required: ["items", "tax_amount", "tip_amount"],
-};
+interface GeminiRestResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+        thought?: boolean;
+      }>;
+    };
+    finishReason?: string;
+  }>;
+  error?: {
+    code?: number;
+    message?: string;
+    status?: string;
+  };
+}
 
-const SYSTEM_PROMPT =
-  "Extrae ítems de facturas colombianas (COP). Convierte miles con punto (32.000) a entero (32000). price = total de la línea. Excluye subtotales/totales de items. tax_amount = impoconsumo/IVA si se suma aparte, si no 0. tip_amount = propina si aparece, si no 0. Si es ilegible, devuelve items: [].";
+const SYSTEM_PROMPT = `Eres un extractor rápido de facturas colombianas (COP).
+Devuelve ÚNICAMENTE un JSON válido con esta forma exacta:
+{"items":[{"name":"Nombre producto","price":32000,"quantity":1}],"tax_amount":0,"tip_amount":0}
+Reglas:
+- Convierte miles con punto ("32.000") a entero sin decimales (32000).
+- price debe ser el valor TOTAL de esa línea (si son 2 unidades de 10.000, price=20000 y quantity=2).
+- Excluye líneas de Subtotal, Total, IVA, Impoconsumo, Propina o Cambio de "items".
+- tax_amount = impoconsumo/IVA solo si se suma aparte del subtotal; si no, 0.
+- tip_amount = propina voluntaria/servicio si aparece; si no, 0.
+- Si la foto está borrosa o no es factura, devuelve {"items":[],"tax_amount":0,"tip_amount":0}.`;
 
 function normalizeBase64Payload(raw: string, fallbackMime?: string): {
   data: string;
   mimeType: string;
 } {
-  const dataUrlMatch = raw.match(/^data:([^;]+);base64,(.+)$/);
+  const trimmed = raw.trim();
+  const dataUrlMatch = trimmed.match(/^data:([^;]+);base64,([\s\S]+)$/i);
   if (dataUrlMatch) {
     return {
       mimeType: dataUrlMatch[1].toLowerCase(),
-      data: dataUrlMatch[2].trim(),
+      data: dataUrlMatch[2].replace(/\s+/g, ""),
     };
   }
   return {
     mimeType: (fallbackMime ?? "image/jpeg").toLowerCase(),
-    data: raw.trim(),
+    data: trimmed.replace(/^data:[^,]+,/, "").replace(/\s+/g, ""),
   };
+}
+
+function stripJsonCodeFences(raw: string): string {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenced ? fenced[1].trim() : trimmed;
 }
 
 function sanitizeScannedResult(raw: unknown): ScannedReceiptResult {
@@ -127,193 +133,157 @@ function sanitizeScannedResult(raw: unknown): ScannedReceiptResult {
   return { items, tax_amount, tip_amount };
 }
 
-interface ErrorClassification {
-  isTimeout: boolean;
-  isRateOrUnavailable: boolean;
-  isAuthError: boolean;
-  thinkingUnsupported: boolean;
-  httpStatus: number | null;
-  errorName: string;
-  rawMessage: string;
-}
-
 function sanitizeDetailText(text: string): string {
   return text
     .replace(/AIza[0-9A-Za-z_-]+/g, "[KEY]")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 220);
+    .slice(0, 160);
 }
 
-function classifyGeminiError(error: unknown): ErrorClassification {
-  const errObj =
-    error && typeof error === "object"
-      ? (error as Record<string, unknown>)
-      : null;
-
-  const rawStatus =
-    typeof errObj?.status === "number"
-      ? errObj.status
-      : typeof errObj?.statusCode === "number"
-      ? errObj.statusCode
-      : null;
-
-  // Evita confundir DOMException.code (ej: 20 = ABORT_ERR) con códigos HTTP
-  const httpStatus =
-    rawStatus !== null && rawStatus >= 100 && rawStatus <= 599
-      ? rawStatus
-      : null;
-
-  const errorName =
-    error instanceof Error
-      ? error.name
-      : typeof errObj?.name === "string"
-      ? errObj.name
-      : "Error";
-
-  const message =
-    error instanceof Error
-      ? error.message
-      : typeof errObj?.message === "string"
-      ? errObj.message
-      : String(error ?? "");
-
-  const cause =
-    errObj?.cause && typeof errObj.cause === "object"
-      ? (errObj.cause as Record<string, unknown>)
-      : null;
-  const causeCode = typeof cause?.code === "string" ? cause.code : "";
-  const combined = `${errorName} ${causeCode} ${message}`.toLowerCase();
-
-  const isTimeout =
-    errorName === "TimeoutError" ||
-    errorName === "AbortError" ||
-    causeCode === "UND_ERR_HEADERS_TIMEOUT" ||
-    causeCode === "UND_ERR_CONNECT_TIMEOUT" ||
-    causeCode === "ETIMEDOUT" ||
-    combined.includes("timeout") ||
-    combined.includes("aborted");
-
-  // Solo 429 o 503 explícitos habilitan fallback a gemini-3.8-flash-lite
-  const isRateOrUnavailable =
-    !isTimeout &&
-    (httpStatus === 429 ||
-      httpStatus === 503 ||
-      combined.includes("429") ||
-      combined.includes("503") ||
-      combined.includes("resource_exhausted") ||
-      combined.includes("unavailable"));
-
-  const isAuthError =
-    httpStatus === 401 ||
-    httpStatus === 403 ||
-    combined.includes("api_key_invalid") ||
-    combined.includes("api key not valid") ||
-    combined.includes("permission_denied");
-
-  const thinkingUnsupported =
-    httpStatus === 400 &&
-    (combined.includes("thinking") || combined.includes("thinkinglevel"));
-
-  const rawMessage = sanitizeDetailText(
-    causeCode && !message.includes(causeCode)
-      ? `${causeCode}: ${message}`
-      : message || "Sin detalle adicional"
-  );
-
-  return {
-    isTimeout,
-    isRateOrUnavailable,
-    isAuthError,
-    thinkingUnsupported,
-    httpStatus,
-    errorName,
-    rawMessage,
-  };
+interface ModelAttemptOutcome {
+  ok: boolean;
+  text?: string;
+  httpStatus?: number;
+  retryNext: boolean;
+  isAuthError: boolean;
+  attemptError: string;
 }
 
-function formatDiagnosticDetail(
-  model: string,
-  info: ErrorClassification
-): string {
-  if (info.isTimeout) {
-    return `Timeout (${info.errorName}) · ${model}: ${info.rawMessage}`;
-  }
-  const statusLabel = info.httpStatus ? `HTTP ${info.httpStatus}` : "API Error";
-  return `${info.errorName} · ${statusLabel} · ${model}: ${info.rawMessage}`;
-}
-
-async function generateWithTimeout(
-  ai: GoogleGenAI,
-  model: string,
-  imageBase64: string,
-  mimeType: string,
-  timeoutMs: number,
-  includeThinkingConfig = true
-) {
-  const effectiveTimeout = Math.max(2_000, Math.min(ATTEMPT_TIMEOUT_MS, timeoutMs));
-  const abortSignal = AbortSignal.timeout(effectiveTimeout);
-
-  return await ai.models.generateContent({
-    model,
-    contents: [
-      {
-        inlineData: {
-          data: imageBase64,
-          mimeType,
-        },
-      },
-      {
-        text: "Extrae ítems, tax_amount y tip_amount en JSON.",
-      },
-    ],
-    config: {
-      abortSignal,
-      systemInstruction: SYSTEM_PROMPT,
-      temperature: 0.1,
-      responseMimeType: "application/json",
-      responseSchema: receiptResponseSchema,
-      ...(includeThinkingConfig
-        ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } }
-        : {}),
-    },
-  });
-}
-
-async function callModelSafe(
-  ai: GoogleGenAI,
-  model: string,
+async function callGeminiRest(
+  apiKey: string,
+  candidate: ModelCandidate,
   imageBase64: string,
   mimeType: string,
   timeoutMs: number
-) {
+): Promise<ModelAttemptOutcome> {
+  const effectiveTimeout = Math.max(2_000, Math.min(ATTEMPT_TIMEOUT_MS, timeoutMs));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), effectiveTimeout);
+
+  const generationConfig: Record<string, unknown> = {
+    responseMimeType: "application/json",
+    temperature: 0.1,
+  };
+  if (candidate.useThinkingBudgetZero) {
+    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    candidate.id
+  )}:generateContent`;
+
   try {
-    return await generateWithTimeout(
-      ai,
-      model,
-      imageBase64,
-      mimeType,
-      timeoutMs,
-      true
-    );
-  } catch (err) {
-    const info = classifyGeminiError(err);
-    if (info.thinkingUnsupported) {
-      return await generateWithTimeout(
-        ai,
-        model,
-        imageBase64,
-        mimeType,
-        timeoutMs,
-        false
-      );
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: SYSTEM_PROMPT }],
+        },
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                inlineData: {
+                  mimeType,
+                  data: imageBase64,
+                },
+              },
+              {
+                text: "Extrae items, tax_amount y tip_amount en JSON.",
+              },
+            ],
+          },
+        ],
+        generationConfig,
+      }),
+    });
+
+    const rawBody = await response.text();
+    let parsedBody: GeminiRestResponse | null = null;
+    try {
+      parsedBody = rawBody ? (JSON.parse(rawBody) as GeminiRestResponse) : null;
+    } catch {
+      parsedBody = null;
     }
-    throw err;
+
+    if (!response.ok) {
+      const apiMsg = sanitizeDetailText(
+        parsedBody?.error?.message || rawBody || response.statusText
+      );
+      const isAuth = response.status === 401 || response.status === 403;
+      const shouldRetry =
+        response.status === 404 ||
+        response.status === 429 ||
+        response.status === 503 ||
+        response.status === 500 ||
+        response.status === 502 ||
+        response.status === 504;
+
+      return {
+        ok: false,
+        httpStatus: response.status,
+        retryNext: shouldRetry,
+        isAuthError: isAuth,
+        attemptError: `${candidate.id} -> HTTP ${response.status}: ${apiMsg}`,
+      };
+    }
+
+    const parts = parsedBody?.candidates?.[0]?.content?.parts ?? [];
+    const text = parts
+      .filter((p) => !p.thought && typeof p.text === "string")
+      .map((p) => p.text ?? "")
+      .join("")
+      .trim();
+
+    if (!text) {
+      const reason = parsedBody?.candidates?.[0]?.finishReason ?? "EMPTY";
+      return {
+        ok: false,
+        httpStatus: 422,
+        retryNext: false,
+        isAuthError: false,
+        attemptError: `${candidate.id} -> Respuesta vacía (${reason})`,
+      };
+    }
+
+    return {
+      ok: true,
+      text,
+      retryNext: false,
+      isAuthError: false,
+      attemptError: "",
+    };
+  } catch (err) {
+    const isAbort =
+      err instanceof Error &&
+      (err.name === "AbortError" || err.name === "TimeoutError");
+    const msg = sanitizeDetailText(
+      err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+    );
+
+    return {
+      ok: false,
+      httpStatus: isAbort ? 504 : 500,
+      retryNext: true,
+      isAuthError: false,
+      attemptError: isAbort
+        ? `${candidate.id} -> Timeout (${Math.round(effectiveTimeout / 1000)}s)`
+        : `${candidate.id} -> Red: ${msg}`,
+    };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 export async function POST(request: Request) {
-  let activeModel = PRIMARY_MODEL;
+  let payloadKb = 0;
 
   try {
     const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -323,7 +293,7 @@ export async function POST(request: Request) {
           error:
             "Falta configurar GEMINI_API_KEY en las variables de entorno del servidor. Mientras tanto, puedes ingresar los ítems manualmente.",
           statusCode: 500,
-          detail: "ConfigError · HTTP 500: GEMINI_API_KEY ausente o vacía",
+          detail: "ConfigError · GEMINI_API_KEY ausente o vacía",
         },
         { status: 500 }
       );
@@ -358,6 +328,8 @@ export async function POST(request: Request) {
     }
 
     const approximateBytes = Math.round((data.length * 3) / 4);
+    payloadKb = Math.round(approximateBytes / 1024);
+
     if (approximateBytes > MAX_IMAGE_BYTES) {
       const sizeMb = (approximateBytes / (1024 * 1024)).toFixed(2);
       return NextResponse.json(
@@ -365,7 +337,7 @@ export async function POST(request: Request) {
           error:
             "La foto pesa más de 3.5 MB. Toma una foto más ligera o desde un poco más lejos para continuar.",
           statusCode: 413,
-          detail: `PayloadTooLarge · HTTP 413: Imagen de ${sizeMb} MB (> 3.5 MB)`,
+          detail: `PayloadTooLarge · ${payloadKb} KB (${sizeMb} MB > 3.5 MB)`,
         },
         { status: 413 }
       );
@@ -377,65 +349,80 @@ export async function POST(request: Request) {
         : mimeType
       : "image/jpeg";
 
-    const ai = new GoogleGenAI({ apiKey });
-    const startedAt = Date.now();
+    const deadlineAt = Date.now() + OVERALL_DEADLINE_MS;
+    const attemptErrors: string[] = [];
+    let winnerModel = "";
+    let winnerText = "";
+    let lastHttpStatus = 503;
 
-    let response;
-    try {
-      activeModel = PRIMARY_MODEL;
-      response = await callModelSafe(
-        ai,
-        PRIMARY_MODEL,
+    for (const candidate of MODEL_CHAIN) {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs < 2_000) {
+        attemptErrors.push(`${candidate.id} -> Omitido (sin tiempo restante)`);
+        break;
+      }
+
+      const outcome = await callGeminiRest(
+        apiKey,
+        candidate,
         data,
         safeMimeType,
-        ATTEMPT_TIMEOUT_MS
+        remainingMs
       );
-    } catch (primaryErr) {
-      const primaryInfo = classifyGeminiError(primaryErr);
 
-      // Reintentar con gemini-3.8-flash-lite ÚNICAMENTE si Google devolvió 429 o 503 explícito
-      if (primaryInfo.isRateOrUnavailable) {
-        const elapsedMs = Date.now() - startedAt;
-        const remainingMs = Math.max(5_000, ATTEMPT_TIMEOUT_MS - elapsedMs);
-        console.warn(
-          `[scan-receipt] ${PRIMARY_MODEL} devolvió ${primaryInfo.httpStatus ?? "429/503"}, intentando respaldo ${FALLBACK_MODEL}`
+      if (outcome.ok && outcome.text) {
+        winnerModel = candidate.id;
+        winnerText = outcome.text;
+        break;
+      }
+
+      if (outcome.httpStatus) {
+        lastHttpStatus = outcome.httpStatus;
+      }
+      attemptErrors.push(outcome.attemptError);
+      console.warn(`[scan-receipt] (${payloadKb} KB) ${outcome.attemptError}`);
+
+      if (outcome.isAuthError) {
+        const authStatus = outcome.httpStatus ?? 403;
+        return NextResponse.json(
+          {
+            error:
+              "La clave de Gemini API fue rechazada o no tiene permisos activos. Revisa GEMINI_API_KEY en Vercel.",
+            statusCode: authStatus,
+            detail: `Imagen: ${payloadKb} KB | ${attemptErrors.join(" | ")}`,
+          },
+          { status: authStatus }
         );
-        activeModel = FALLBACK_MODEL;
-        response = await callModelSafe(
-          ai,
-          FALLBACK_MODEL,
-          data,
-          safeMimeType,
-          remainingMs
-        );
-      } else {
-        throw primaryErr;
+      }
+
+      if (!outcome.retryNext) {
+        break;
       }
     }
 
-    const rawText = response.text?.trim();
-    if (!rawText) {
+    if (!winnerText) {
+      const finalStatus =
+        lastHttpStatus === 422 || lastHttpStatus === 400 ? lastHttpStatus : 503;
       return NextResponse.json(
         {
-          error:
-            "No pudimos leer los datos de la factura. Revisa que la foto esté enfocada o agrega los ítems manualmente.",
-          statusCode: 422,
-          detail: `EmptyResponse · HTTP 422 · ${activeModel}: respuesta vacía`,
+          error: CONGESTED_ERROR_MESSAGE,
+          statusCode: finalStatus,
+          detail: `Imagen: ${payloadKb} KB | ${attemptErrors.join(" | ")}`,
         },
-        { status: 422 }
+        { status: finalStatus }
       );
     }
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(rawText);
+      parsed = JSON.parse(stripJsonCodeFences(winnerText));
     } catch {
       return NextResponse.json(
         {
           error:
             "La IA devolvió una respuesta inesperada al leer la foto. Puedes reintentar o agregar los ítems a mano.",
           statusCode: 422,
-          detail: `SyntaxError · HTTP 422 · ${activeModel}: JSON inválido`,
+          detail: `Imagen: ${payloadKb} KB | ${winnerModel} -> JSON inválido`,
         },
         { status: 422 }
       );
@@ -449,7 +436,7 @@ export async function POST(request: Request) {
           error:
             "No encontramos ítems legibles en esta foto. Puede estar borrosa o con poca luz; intenta tomarla de nuevo o agrégalos manualmente.",
           statusCode: 422,
-          detail: `UnreadableReceipt · HTTP 422 · ${activeModel}: 0 ítems detectados`,
+          detail: `Imagen: ${payloadKb} KB | ${winnerModel} -> 0 ítems detectados`,
           result,
         },
         { status: 422 }
@@ -458,55 +445,19 @@ export async function POST(request: Request) {
 
     return NextResponse.json(result, { status: 200 });
   } catch (error) {
-    const info = classifyGeminiError(error);
-    const detail = formatDiagnosticDetail(activeModel, info);
-    console.error("[scan-receipt] Error analizando factura:", detail, error);
+    const msg = sanitizeDetailText(
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+    );
+    console.error("[scan-receipt] Error inesperado:", error);
 
-    if (info.isTimeout) {
-      return NextResponse.json(
-        {
-          error: TIMEOUT_ERROR_MESSAGE,
-          statusCode: 504,
-          detail,
-        },
-        { status: 504 }
-      );
-    }
-
-    if (info.isRateOrUnavailable) {
-      const status = info.httpStatus === 429 ? 429 : 503;
-      return NextResponse.json(
-        {
-          error: CONGESTED_ERROR_MESSAGE,
-          statusCode: status,
-          detail,
-        },
-        { status }
-      );
-    }
-
-    if (info.isAuthError) {
-      const status = info.httpStatus ?? 403;
-      return NextResponse.json(
-        {
-          error:
-            "La clave de Gemini API fue rechazada o no tiene permisos activos. Revisa GEMINI_API_KEY en Vercel.",
-          statusCode: status,
-          detail,
-        },
-        { status }
-      );
-    }
-
-    const httpStatus = info.httpStatus ?? 500;
     return NextResponse.json(
       {
         error:
           "Hubo un problema conectando con la IA para leer la factura. Intenta de nuevo o ingresa los ítems manualmente.",
-        statusCode: httpStatus,
-        detail,
+        statusCode: 500,
+        detail: `Imagen: ${payloadKb} KB | ${msg}`,
       },
-      { status: httpStatus }
+      { status: 500 }
     );
   }
 }

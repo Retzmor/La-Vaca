@@ -7,8 +7,8 @@ export interface CompressedImageResult {
   approximateBytes: number;
 }
 
-const DEFAULT_MAX_DIMENSION = 1280;
-const DEFAULT_QUALITY = 0.75;
+const DEFAULT_MAX_DIMENSION = 1024;
+const DEFAULT_QUALITY = 0.72;
 
 function loadImageFromFile(file: File): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
