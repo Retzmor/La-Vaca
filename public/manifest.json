@@ -1,0 +1,19 @@
+{
+  "name": "La Vaca — Divide cuentas en segundos",
+  "short_name": "La Vaca",
+  "description": "Divide cuentas de restaurantes, pedidos o vacas en Colombia con Nequi, Daviplata y llaves Bre-B. Sin registros.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F5F4EF",
+  "theme_color": "#0B875B",
+  "orientation": "portrait",
+  "lang": "es-CO",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
