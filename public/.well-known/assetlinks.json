@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.erwinsalas.lavaca",
+      "sha256_cert_fingerprints": [
+        "BF:B9:39:BD:61:F6:D3:A4:D7:6C:9E:2E:EB:79:94:96:B3:D7:35:6B:BD:0D:98:6A:83:83:F8:BA:CA:B0:09:EE"
+      ]
+    }
+  }
+]
