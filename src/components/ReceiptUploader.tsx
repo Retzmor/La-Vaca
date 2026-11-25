@@ -93,7 +93,7 @@ export function ReceiptUploader({
     setIsScanning(true);
 
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 22_000);
+    const timeoutId = window.setTimeout(() => controller.abort(), 28_000);
 
     try {
       const compressed = await compressReceiptImage(file, 1280, 0.75);
@@ -182,7 +182,7 @@ export function ReceiptUploader({
       setScanError(message);
       setScanDetail(
         isAbort
-          ? "Timeout en cliente (22s)"
+          ? "Timeout en cliente (28s)"
           : error instanceof Error
           ? error.message.slice(0, 140)
           : "Error de red inesperado"
