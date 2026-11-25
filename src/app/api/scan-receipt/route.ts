@@ -5,19 +5,18 @@ import type { ScannedReceiptResult } from "@/types/database";
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
-const ATTEMPT_TIMEOUT_MS = 9_000;
-const OVERALL_DEADLINE_MS = 27_500;
+const ATTEMPT_TIMEOUT_MS = 14_000;
+const OVERALL_DEADLINE_MS = 28_000;
 const MAX_IMAGE_BYTES = Math.round(3.5 * 1024 * 1024);
 
 interface ModelCandidate {
   id: string;
-  useThinkingBudgetZero: boolean;
+  thinkingLevel?: "MINIMAL";
 }
 
 const MODEL_CHAIN: readonly ModelCandidate[] = [
-  { id: "gemini-2.5-flash", useThinkingBudgetZero: true },
-  { id: "gemini-2.5-flash-lite", useThinkingBudgetZero: true },
-  { id: "gemini-2.0-flash", useThinkingBudgetZero: false },
+  { id: "gemini-3.8-flash", thinkingLevel: "MINIMAL" },
+  { id: "gemini-3.5-flash-lite", thinkingLevel: "MINIMAL" },
 ];
 
 const CONGESTED_ERROR_MESSAGE =
@@ -155,19 +154,21 @@ async function callGeminiRest(
   candidate: ModelCandidate,
   imageBase64: string,
   mimeType: string,
-  timeoutMs: number
+  timeoutMs: number,
+  includeThinking = true
 ): Promise<ModelAttemptOutcome> {
   const effectiveTimeout = Math.max(2_000, Math.min(ATTEMPT_TIMEOUT_MS, timeoutMs));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), effectiveTimeout);
 
   const generationConfig: Record<string, unknown> = {
-    responseMimeType: "application/json",
     temperature: 0.1,
+    maxOutputTokens: 1024,
+    responseMimeType: "application/json",
+    ...(includeThinking && candidate.thinkingLevel
+      ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
+      : {}),
   };
-  if (candidate.useThinkingBudgetZero) {
-    generationConfig.thinkingConfig = { thinkingBudget: 0 };
-  }
 
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     candidate.id
@@ -217,6 +218,24 @@ async function callGeminiRest(
       const apiMsg = sanitizeDetailText(
         parsedBody?.error?.message || rawBody || response.statusText
       );
+
+      // Si algún modelo rechaza thinkingConfig con 400, reintenta ese modelo sin thinkingConfig
+      if (
+        includeThinking &&
+        response.status === 400 &&
+        /thinking/i.test(apiMsg)
+      ) {
+        clearTimeout(timer);
+        return await callGeminiRest(
+          apiKey,
+          candidate,
+          imageBase64,
+          mimeType,
+          timeoutMs,
+          false
+        );
+      }
+
       const isAuth = response.status === 401 || response.status === 403;
       const shouldRetry =
         response.status === 404 ||
